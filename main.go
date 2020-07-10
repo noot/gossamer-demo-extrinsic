@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"sync"
 	"time"
@@ -18,6 +21,10 @@ import (
 	"github.com/ChainSafe/gossamer/lib/common/optional"
 	"github.com/ChainSafe/gossamer/lib/runtime/extrinsic"
 )
+
+var keys = []string{"alice", "bob", "charlie", "dave", "eve", "fred", "george", "heather", "ian"}
+var genesis = "genesis.json"
+var config = "config.toml"
 
 var (
 	maxRetries        = 10
@@ -137,6 +144,56 @@ func getStorage(endpoint string, key []byte) ([]byte, error) {
 	return value, nil
 }
 
+func initAndStart(idx int, outfile *os.File) *exec.Cmd {
+	basepath := "~/.gossamer_" + keys[idx]
+
+	initCmd := exec.Command("../../ChainSafe/gossamer/bin/gossamer",
+		"init",
+		"--config", config,
+		"--basepath", basepath,
+		"--genesis", genesis,
+		"--force",
+	)
+
+	// init gossamer
+	stdout, err := initCmd.CombinedOutput()
+	if err != nil {
+		panic(err)
+	}
+
+	outfile.Write(stdout)
+	fmt.Println("initialized node", keys[idx])
+
+	gssmrCmd := exec.Command("../../ChainSafe/gossamer/bin/gossamer",
+		"--port", strconv.Itoa(7000+idx),
+		"--config", config,
+		"--key", keys[idx],
+		"--basepath", basepath,
+		"--rpcport", strconv.Itoa(8540+idx),
+		"--rpc",
+	)
+
+	stdoutPipe, err := gssmrCmd.StdoutPipe()
+	if err != nil {
+		panic(err)
+	}
+
+	stderrPipe, err := gssmrCmd.StderrPipe()
+	if err != nil {
+		panic(err)
+	}
+
+	err = gssmrCmd.Start()
+	if err != nil {
+		panic(err)
+	}
+
+	writer := bufio.NewWriter(outfile)
+	go io.Copy(writer, stdoutPipe)
+	go io.Copy(writer, stderrPipe)
+	return gssmrCmd
+}
+
 func main() {
 	baseport := 8540
 	num := 3
@@ -148,7 +205,46 @@ func main() {
 			fmt.Println(err)
 			os.Exit(1)
 		}
+
+		if num%3 != 0 {
+			fmt.Print("must do 3, 6, 9 nodes")
+			os.Exit(1)
+		}
 	}
+
+	fmt.Println("num nodes:", num)
+
+	// initialize and start nodes
+	processes := []*exec.Cmd{}
+
+	var wg sync.WaitGroup
+	wg.Add(num)
+	for i := 0; i < num; i++ {
+		outfile, err := os.Create("./log_" + keys[i] + ".out")
+		if err != nil {
+			panic(err)
+		}
+		defer outfile.Close()
+
+		go func(i int, outfile *os.File) {
+			p := initAndStart(i, outfile)
+			processes = append(processes, p)
+			wg.Done()
+		}(i, outfile)
+	}
+	wg.Wait()
+
+	for i := 0; i < num; i++ {
+		go func(i int) {
+			err = processes[i].Wait()
+			if err != nil {
+				fmt.Printf("process %s failed!!! %s\n", keys[i], err)
+			}
+		}(i)
+	}
+
+	// wait for node to start
+	time.Sleep(time.Second * 5)
 
 	// create StorageChange extrinsic
 	key := []byte("noot")
@@ -189,7 +285,7 @@ func main() {
 	fmt.Println("submitted extrinsic")
 	fmt.Printf("response: %s\n", respBody)
 
-	var wg sync.WaitGroup
+	//var wg sync.WaitGroup
 
 	// query for storage
 	for i := 0; i < num; i++ {
