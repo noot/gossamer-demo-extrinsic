@@ -27,7 +27,7 @@ var genesis = "genesis.json"
 var config = "config.toml"
 
 var (
-	maxRetries        = 10
+	maxRetries        = 36
 	httpClientTimeout = 120 * time.Second
 	dialTimeout       = 60 * time.Second
 
@@ -144,7 +144,7 @@ func getStorage(endpoint string, key []byte) ([]byte, error) {
 	return value, nil
 }
 
-func initAndStart(idx int, outfile *os.File) *exec.Cmd {
+func initAndStart(idx int, outfile, errfile *os.File) *exec.Cmd {
 	basepath := "~/.gossamer_" + keys[idx]
 
 	initCmd := exec.Command("../../ChainSafe/gossamer/bin/gossamer",
@@ -190,7 +190,8 @@ func initAndStart(idx int, outfile *os.File) *exec.Cmd {
 
 	writer := bufio.NewWriter(outfile)
 	go io.Copy(writer, stdoutPipe)
-	go io.Copy(writer, stderrPipe)
+	errWriter := bufio.NewWriter(errfile)
+	go io.Copy(errWriter, stderrPipe)
 	return gssmrCmd
 }
 
@@ -226,13 +227,28 @@ func main() {
 		}
 		defer outfile.Close()
 
+		errfile, err := os.Create("./err_" + keys[i] + ".out")
+		if err != nil {
+			panic(err)
+		}
+		defer outfile.Close()
+
 		go func(i int, outfile *os.File) {
-			p := initAndStart(i, outfile)
+			p := initAndStart(i, outfile, errfile)
 			processes = append(processes, p)
 			wg.Done()
 		}(i, outfile)
 	}
 	wg.Wait()
+
+	defer func() {
+		for i := 0; i < num; i++ {
+			err = processes[i].Process.Kill()
+			if err != nil {
+				fmt.Printf("could not kill process %s!!! %s\n", keys[i], err)
+			}
+		}
+	}()
 
 	for i := 0; i < num; i++ {
 		go func(i int) {
@@ -263,7 +279,7 @@ func main() {
 	for i := 0; i < num; i++ {
 
 		var res []byte
-		for j := 0; j < maxRetries; j++ {
+		for j := 0; j < 8; j++ {
 			res, err = getStorage("http://localhost:"+strconv.Itoa(baseport+i), key)
 			if err == nil {
 				break
