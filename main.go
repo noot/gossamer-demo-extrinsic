@@ -245,19 +245,10 @@ func main() {
 		for i := 0; i < num; i++ {
 			err = processes[i].Process.Kill()
 			if err != nil {
-				fmt.Printf("could not kill process %s!!! %s\n", keys[i], err)
+				//fmt.Printf("could not kill process %s!!! %s\n", keys[i], err)
 			}
 		}
 	}()
-
-	for i := 0; i < num; i++ {
-		go func(i int) {
-			err = processes[i].Wait()
-			if err != nil {
-				fmt.Printf("process %s failed!!! %s\n", keys[i], err)
-			}
-		}(i)
-	}
 
 	// wait for node to start
 	time.Sleep(time.Second * 5)
@@ -300,8 +291,6 @@ func main() {
 
 	fmt.Println("submitted extrinsic")
 	fmt.Printf("response: %s\n", respBody)
-
-	//var wg sync.WaitGroup
 
 	// query for storage
 	for i := 0; i < num; i++ {
