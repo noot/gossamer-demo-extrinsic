@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -17,16 +18,47 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ChainSafe/gossamer/dot/rpc/modules"
 	"github.com/ChainSafe/gossamer/lib/common"
 	"github.com/ChainSafe/gossamer/lib/common/optional"
 	"github.com/ChainSafe/gossamer/lib/runtime/extrinsic"
+	"github.com/urfave/cli"
 )
 
-var keys = []string{"alice", "bob", "charlie", "dave", "eve", "fred", "george", "heather", "ian"}
-var genesis = "genesis.json"
-var config = "config.toml"
+var (
+	numFlag = cli.UintFlag{
+		Name:  "num",
+		Usage: "number of nodes",
+	}
+
+	connectFlag = cli.BoolFlag{
+		Name:  "connect",
+		Usage: "directly connect nodes",
+	}
+
+	pathFlag = cli.StringFlag{
+		Name:  "path",
+		Usage: "path to gossamer binary",
+	}
+)
+
+var flags = []cli.Flag{
+	numFlag,
+	connectFlag,
+	pathFlag,
+}
 
 var (
+	app          = cli.NewApp()
+	gossamerPath = "../../ChainSafe/gossamer/bin/gossamer"
+	baseaddr     = "/ip4/127.0.0.1/tcp/"
+
+	keys        = []string{"alice", "bob", "charlie", "dave", "eve", "fred", "george", "heather", "ian"}
+	baseRPCPort = 8540
+	baseport    = 7000
+	genesis     = "genesis.json"
+	config      = "config.toml"
+
 	maxRetries        = 36
 	httpClientTimeout = 120 * time.Second
 	dialTimeout       = 60 * time.Second
@@ -144,10 +176,10 @@ func getStorage(endpoint string, key []byte) ([]byte, error) {
 	return value, nil
 }
 
-func initAndStart(idx int, outfile, errfile *os.File) *exec.Cmd {
+func initAndStart(idx int, genesis, bootnodes string, outfile, errfile *os.File) *exec.Cmd {
 	basepath := "~/.gossamer_" + keys[idx]
 
-	initCmd := exec.Command("../../ChainSafe/gossamer/bin/gossamer",
+	initCmd := exec.Command(gossamerPath,
 		"init",
 		"--config", config,
 		"--basepath", basepath,
@@ -158,34 +190,39 @@ func initAndStart(idx int, outfile, errfile *os.File) *exec.Cmd {
 	// init gossamer
 	stdout, err := initCmd.CombinedOutput()
 	if err != nil {
-		panic(err)
+		fmt.Printf("failed to initialize node %d: %s\n", idx, err)
+		os.Exit(1)
 	}
 
 	outfile.Write(stdout)
 	fmt.Println("initialized node", keys[idx])
 
-	gssmrCmd := exec.Command("../../ChainSafe/gossamer/bin/gossamer",
-		"--port", strconv.Itoa(7000+idx),
+	gssmrCmd := exec.Command(gossamerPath,
+		"--port", strconv.Itoa(baseport+idx),
 		"--config", config,
 		"--key", keys[idx],
 		"--basepath", basepath,
-		"--rpcport", strconv.Itoa(8540+idx),
+		"--rpcport", strconv.Itoa(baseRPCPort+idx),
 		"--rpc",
+		"--bootnodes", bootnodes,
 	)
 
 	stdoutPipe, err := gssmrCmd.StdoutPipe()
 	if err != nil {
-		panic(err)
+		fmt.Printf("failed to get stdoutPipe from node %d: %s\n", idx, err)
+		os.Exit(1)
 	}
 
 	stderrPipe, err := gssmrCmd.StderrPipe()
 	if err != nil {
-		panic(err)
+		fmt.Printf("failed to get stderrPipe from node %d: %s\n", idx, err)
+		os.Exit(1)
 	}
 
 	err = gssmrCmd.Start()
 	if err != nil {
-		panic(err)
+		fmt.Printf("failed to start node %d: %s\n", idx, err)
+		os.Exit(1)
 	}
 
 	writer := bufio.NewWriter(outfile)
@@ -195,22 +232,46 @@ func initAndStart(idx int, outfile, errfile *os.File) *exec.Cmd {
 	return gssmrCmd
 }
 
+func getPeerID(endpoint string) (string, error) {
+	respBody, err := postRPC("system_networkState", endpoint, "[]")
+	if err != nil {
+		return "", err
+	}
+
+	networkState := new(modules.SystemNetworkStateResponse)
+	err = decodeRPC(respBody, &networkState)
+	if err != nil {
+		return "", err
+	}
+
+	return networkState.NetworkState.PeerID, nil
+}
+
+func init() {
+	app.Action = run
+	app.Flags = flags
+}
+
 func main() {
-	baseport := 8540
-	num := 3
+	if err := app.Run(os.Args); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx *cli.Context) error {
 	var err error
 
-	if len(os.Args) > 1 {
-		num, err = strconv.Atoi(os.Args[1])
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
+	num := int(ctx.Uint(numFlag.Name))
+	if num%3 != 0 {
+		fmt.Print("must do 3, 6, 9 nodes")
+		os.Exit(1)
+	}
 
-		if num%3 != 0 {
-			fmt.Print("must do 3, 6, 9 nodes")
-			os.Exit(1)
-		}
+	connect := ctx.Bool(connectFlag.Name)
+	path := ctx.String(pathFlag.Name)
+	if path != "" {
+		gossamerPath = path
 	}
 
 	fmt.Println("num nodes:", num)
@@ -220,6 +281,8 @@ func main() {
 
 	var wg sync.WaitGroup
 	wg.Add(num)
+	var nodeAddr string // used for directly connecting nodes
+
 	for i := 0; i < num; i++ {
 		outfile, err := os.Create("./log_" + keys[i] + ".out")
 		if err != nil {
@@ -231,26 +294,62 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		defer outfile.Close()
+		defer errfile.Close()
+
+		if connect && i == 0 {
+			// all other nodes will directly connect to the first node
+			// the other nodes are able to discover each other through the connection to the first node
+			// as well as mDNS
+			p := initAndStart(i, genesis, "", outfile, errfile)
+			processes = append(processes, p)
+			wg.Done()
+
+			var peerID string
+			for j := 0; j < maxRetries; j++ {
+				peerID, err = getPeerID("http://localhost:" + strconv.Itoa(baseRPCPort))
+				if err == nil {
+					break
+				}
+				time.Sleep(time.Second)
+			}
+
+			if err != nil {
+				fmt.Println("failed to get peerID from first node")
+				return err
+			}
+
+			nodeAddr = baseaddr + strconv.Itoa(baseport) + "/p2p/" + peerID
+			fmt.Println("got node addr for node", nodeAddr)
+			continue
+		}
 
 		go func(i int, outfile *os.File) {
-			p := initAndStart(i, outfile, errfile)
+			p := initAndStart(i, genesis, nodeAddr, outfile, errfile)
 			processes = append(processes, p)
 			wg.Done()
 		}(i, outfile)
 	}
 	wg.Wait()
 
+	for i := 0; i < num; i++ {
+		go func(i int) {
+			err = processes[i].Wait()
+			if err != nil {
+				fmt.Printf("process %s failed!!! %s\n", keys[i], err)
+			}
+		}(i)
+	}
+
 	defer func() {
 		for i := 0; i < num; i++ {
 			err = processes[i].Process.Kill()
 			if err != nil {
-				//fmt.Printf("could not kill process %s!!! %s\n", keys[i], err)
+				fmt.Printf("could not kill process %s!!! %s\n", keys[i], err)
 			}
 		}
 	}()
 
-	// wait for node to start
+	// wait for nodes to start
 	time.Sleep(time.Second * 5)
 
 	// create StorageChange extrinsic
@@ -268,10 +367,9 @@ func main() {
 	// get storage before
 	fmt.Println("storage before")
 	for i := 0; i < num; i++ {
-
 		var res []byte
 		for j := 0; j < 8; j++ {
-			res, err = getStorage("http://localhost:"+strconv.Itoa(baseport+i), key)
+			res, err = getStorage("http://localhost:"+strconv.Itoa(baseRPCPort+i), key)
 			if err == nil {
 				break
 			}
@@ -283,13 +381,14 @@ func main() {
 	}
 
 	// submit extrinsic
-	respBody, err := postRPC("author_submitExtrinsic", "http://localhost:"+strconv.Itoa(baseport), "\"0x"+txStr+"\"")
+	r := rand.Intn(num)
+	respBody, err := postRPC("author_submitExtrinsic", "http://localhost:"+strconv.Itoa(baseRPCPort+r), "\"0x"+txStr+"\"")
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
-	fmt.Println("submitted extrinsic")
+	fmt.Printf("submitted extrinsic to node %d\n", r)
 	fmt.Printf("response: %s\n", respBody)
 
 	// query for storage
@@ -299,7 +398,7 @@ func main() {
 		go func(i int) {
 			var res []byte
 			for j := 0; j < maxRetries; j++ {
-				res, err = getStorage("http://localhost:"+strconv.Itoa(baseport+i), key)
+				res, err = getStorage("http://localhost:"+strconv.Itoa(baseRPCPort+i), key)
 				if err == nil && !bytes.Equal(res, []byte{}) {
 					break
 				}
@@ -313,4 +412,5 @@ func main() {
 	}
 
 	wg.Wait()
+	return nil
 }
